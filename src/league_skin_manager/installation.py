@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import stat
+import subprocess
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date
@@ -22,6 +24,7 @@ from .config import (
 UNINSTALL_REGISTRY_PARENT = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
 UNINSTALL_REGISTRY_KEY = rf"{UNINSTALL_REGISTRY_PARENT}\{APP_NAME}"
 INSTALL_OPERATION_MUTEX_NAME = rf"Local\{APP_NAME}_InstallOperation_v1"
+START_MENU_SHORTCUT_NAME = f"{APP_DISPLAY_NAME}.lnk"
 
 
 class InstallationError(RuntimeError):
@@ -228,6 +231,92 @@ def installed_size_kib(paths: tuple[Path, ...]) -> int:
     return max(1, (total + 1023) // 1024)
 
 
+def start_menu_shortcut_path(appdata: str | Path | None = None) -> Path:
+    raw = appdata if appdata is not None else os.environ.get("APPDATA")
+    if not raw:
+        raise InstallationError("APPDATA is unavailable for the Start Menu shortcut")
+    root = Path(raw).resolve()
+    programs = root / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    if programs.exists() and (_is_reparse_point(programs) or not programs.is_dir()):
+        raise InstallationError("The per-user Start Menu Programs folder is unsafe")
+    return programs / START_MENU_SHORTCUT_NAME
+
+
+def create_start_menu_shortcut(
+    layout: InstallLayout,
+    *,
+    appdata: str | Path | None = None,
+    runner: Any = subprocess.run,
+) -> Path:
+    """Create one exact per-user Shell Link through Windows' supported COM API."""
+
+    layout.validated_install_dir()
+    if not layout.executable.is_file():
+        raise InstallationError("Cannot create a shortcut before the application is installed")
+    shortcut = start_menu_shortcut_path(appdata)
+    shortcut.parent.mkdir(parents=True, exist_ok=True)
+    if shortcut.exists() and (_is_reparse_point(shortcut) or not shortcut.is_file()):
+        raise InstallationError("The existing Start Menu shortcut path is unsafe")
+    system_root = os.environ.get("SYSTEMROOT")
+    if not system_root:
+        raise InstallationError("SYSTEMROOT is unavailable for shortcut creation")
+    powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not powershell.is_file():
+        raise InstallationError("Windows PowerShell is unavailable for shortcut creation")
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($env:LSMLTK_SHORTCUT_PATH)
+$shortcut.TargetPath = $env:LSMLTK_SHORTCUT_TARGET
+$shortcut.WorkingDirectory = $env:LSMLTK_SHORTCUT_WORKDIR
+$shortcut.Description = $env:LSMLTK_SHORTCUT_DESCRIPTION
+$shortcut.Save()
+""".strip()
+    environment = os.environ.copy()
+    environment["LSMLTK_SHORTCUT_PATH"] = str(shortcut)
+    environment["LSMLTK_SHORTCUT_TARGET"] = str(layout.executable.resolve())
+    environment["LSMLTK_SHORTCUT_WORKDIR"] = str(layout.install_dir.resolve())
+    environment["LSMLTK_SHORTCUT_DESCRIPTION"] = APP_DISPLAY_NAME
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        completed = runner(
+            [
+                str(powershell),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-EncodedCommand",
+                encoded,
+            ],
+            capture_output=True,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            env=environment,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallationError(f"Could not create the Start Menu shortcut: {exc}") from exc
+    if completed.returncode != 0 or not shortcut.is_file() or shortcut.stat().st_size <= 0:
+        detail = str(getattr(completed, "stderr", "")).strip()[:300]
+        suffix = f": {detail}" if detail else ""
+        raise InstallationError(f"Could not create the Start Menu shortcut{suffix}")
+    return shortcut
+
+
+def remove_start_menu_shortcut(appdata: str | Path | None = None) -> bool:
+    """Remove only this app's exact per-user shortcut."""
+
+    shortcut = start_menu_shortcut_path(appdata)
+    if not shortcut.exists():
+        return False
+    if _is_reparse_point(shortcut) or not shortcut.is_file():
+        raise InstallationError("The Start Menu shortcut path is unsafe")
+    shortcut.unlink()
+    return True
+
+
 __all__ = [
     "AppsAndFeaturesRegistration",
     "INSTALL_OPERATION_MUTEX_NAME",
@@ -236,6 +325,9 @@ __all__ = [
     "UNINSTALL_REGISTRY_KEY",
     "UNINSTALL_REGISTRY_PARENT",
     "apps_entry_values",
+    "create_start_menu_shortcut",
     "installed_size_kib",
     "quote_command",
+    "remove_start_menu_shortcut",
+    "start_menu_shortcut_path",
 ]

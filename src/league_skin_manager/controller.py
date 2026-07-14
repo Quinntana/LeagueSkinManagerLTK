@@ -53,6 +53,8 @@ class ProcessMonitor(Protocol):
 
 
 SyncCallable = Callable[[Event], SyncOutcome | None]
+SyncPreparation = Callable[[], bool]
+SyncRollback = Callable[[], None]
 ManagerLauncher = Callable[[], bool | None]
 StatusSink = Callable[[AppState, str], None]
 NotifySink = Callable[[str, str], None]
@@ -61,7 +63,7 @@ NotifySink = Callable[[str, str], None]
 _DEFAULT_STATUS: dict[AppState, str] = {
     AppState.STARTING: "Starting",
     AppState.OFFLINE_READY: "Ready offline",
-    AppState.SYNCING: "Syncing skins",
+    AppState.SYNCING: "Refreshing library",
     AppState.READY: "Ready",
     AppState.ERROR: "An error occurred",
     AppState.STOPPING: "Stopping",
@@ -80,6 +82,7 @@ class AppController:
         status_sink: StatusSink | None = None,
         notify_sink: NotifySink | None = None,
         sync_on_start: bool = True,
+        auto_launch_on_league: bool = False,
         shutdown_timeout_seconds: float = 10.0,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -92,6 +95,7 @@ class AppController:
         self._status_sink = status_sink
         self._notify_sink = notify_sink
         self._sync_on_start = sync_on_start
+        self._auto_launch_on_league = auto_launch_on_league
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._logger = logger or logging.getLogger(__name__)
 
@@ -178,17 +182,28 @@ class AppController:
 
         if state is AppState.ERROR:
             self._publish_status(state, detail)
-            self._notify("LeagueSkinManagerVN", detail)
+            self._notify("League Skin Manager LTK", detail)
             return False
         if self._sync_on_start:
             self.request_sync()
         return True
 
-    def request_sync(self) -> bool:
-        """Start the sole sync worker, or reject a duplicate request."""
+    def request_sync(
+        self,
+        *,
+        prepare: SyncPreparation | None = None,
+        rollback: SyncRollback | None = None,
+    ) -> bool:
+        """Atomically prepare and start the sole library worker.
+
+        ``prepare`` runs only after duplicate/stopping checks and before the
+        worker can start. This closes the import queue vs. Refresh race without
+        coupling the controller to a particular operation type.
+        """
 
         rejection: str | None = None
         sync_thread: Thread | None = None
+        prepared = False
         state = self.state
         detail = self.status_detail
         # Serialize the decision with manager launch. Whichever operation wins
@@ -199,26 +214,34 @@ class AppController:
             elif self._stop_event.is_set() or self._state is AppState.STOPPING:
                 rejection = "The application is stopping."
             elif self._sync_running:
-                rejection = "A skin sync is already in progress."
+                rejection = "A library operation is already in progress."
             else:
-                self._sync_running = True
-                self._startup_sync_pending = False
-                self._state = AppState.SYNCING
-                self._status_detail = _DEFAULT_STATUS[self._state]
-                sync_thread = Thread(
-                    target=self._run_sync,
-                    name="skin-sync-worker",
-                    # A daemon could be killed halfway through an atomic install.
-                    daemon=False,
-                )
-                self._sync_thread = sync_thread
-                self._sync_threads.add(sync_thread)
+                try:
+                    prepared = prepare is None or prepare()
+                except Exception as exc:
+                    self._logger.exception("Could not prepare library operation")
+                    rejection = f"Could not queue the library operation: {exc}"
+                if rejection is None and not prepared:
+                    rejection = "The library operation could not be queued."
+                if rejection is None:
+                    self._sync_running = True
+                    self._startup_sync_pending = False
+                    self._state = AppState.SYNCING
+                    self._status_detail = _DEFAULT_STATUS[self._state]
+                    sync_thread = Thread(
+                        target=self._run_sync,
+                        name="library-worker",
+                        # A daemon could be killed halfway through an atomic install.
+                        daemon=False,
+                    )
+                    self._sync_thread = sync_thread
+                    self._sync_threads.add(sync_thread)
 
-                state = self._state
-                detail = self._status_detail
+                    state = self._state
+                    detail = self._status_detail
 
         if rejection is not None:
-            self._notify("Sync not started", rejection)
+            self._notify("Library operation not started", rejection)
             return False
 
         if sync_thread is None:
@@ -229,12 +252,16 @@ class AppController:
             if self._stop_event.is_set() or self._state is AppState.STOPPING:
                 self._sync_running = False
                 self._sync_threads.discard(sync_thread)
+                if prepared and rollback is not None:
+                    rollback()
                 return False
             try:
                 sync_thread.start()
             except Exception as exc:
                 self._sync_running = False
                 self._sync_threads.discard(sync_thread)
+                if prepared and rollback is not None:
+                    rollback()
                 self._state = AppState.ERROR
                 self._status_detail = f"Unable to start sync: {exc}"
                 self._logger.exception("Unable to start sync worker")
@@ -243,12 +270,12 @@ class AppController:
 
         if state is AppState.ERROR:
             self._publish_status(state, detail)
-            self._notify("Skin sync failed", detail)
+            self._notify("Library refresh failed", detail)
             return False
         return True
 
     def start_manager(self) -> bool:
-        """Launch CSLOL Manager, or safely queue it behind an active sync."""
+        """Launch LTK Manager, or safely queue it behind an active library operation."""
 
         with self._lock:
             if self._stop_event.is_set():
@@ -260,8 +287,8 @@ class AppController:
                 queued = False
         if queued:
             self._notify(
-                "CSLOL Manager",
-                "Manager launch queued until skin synchronization finishes.",
+                "LTK Manager",
+                "Manager launch queued until the library operation finishes.",
             )
             return True
         return self._launch_manager_now()
@@ -279,11 +306,11 @@ class AppController:
             try:
                 result = self._launcher()
             except Exception as exc:
-                self._logger.exception("CSLOL Manager launch failed")
-                self._notify("CSLOL Manager", f"Could not start manager: {exc}")
+                self._logger.exception("LTK Manager launch failed")
+                self._notify("LTK Manager", f"Could not start manager: {exc}")
                 return False
             if result is False:
-                self._notify("CSLOL Manager", "Could not start manager.")
+                self._notify("LTK Manager", "Could not start manager.")
                 return False
             return True
 
@@ -325,7 +352,7 @@ class AppController:
             names = ", ".join(alive)
             self._logger.warning("Shutdown timed out waiting for: %s", names)
             self._notify(
-                "LeagueSkinManagerVN",
+                "League Skin Manager LTK",
                 f"Shutdown timed out waiting for: {names}",
             )
             return False
@@ -343,10 +370,10 @@ class AppController:
                 elif not isinstance(outcome, SyncOutcome):
                     raise TypeError("sync must return SyncOutcome or None")
             except Exception as exc:
-                self._logger.exception("Skin synchronization failed")
-                self._complete_sync(AppState.ERROR, f"Sync failed: {exc}")
+                self._logger.exception("Library operation failed")
+                self._complete_sync(AppState.ERROR, f"Library operation failed: {exc}")
                 if not self._stop_event.is_set():
-                    self._notify("Skin sync failed", str(exc))
+                    self._notify("Library operation failed", str(exc))
             else:
                 self._complete_sync(outcome.state, outcome.detail)
         finally:
@@ -421,7 +448,7 @@ class AppController:
         if not self._launch_manager_now():
             launch_kind = "Deferred" if deferred else "Automatic"
             self._logger.warning(
-                "%s CSLOL Manager launch failed for League PID %s",
+                "%s LTK Manager launch failed for League PID %s",
                 launch_kind,
                 pid,
             )
@@ -431,6 +458,10 @@ class AppController:
             if self._stop_event.is_set():
                 return
             self._current_league_pid = pid
+            if not self._auto_launch_on_league:
+                self._launched_for_league_pid = None
+                self._pending_league_pid = None
+                return
             if pid is None:
                 self._launched_for_league_pid = None
                 self._pending_league_pid = None
@@ -476,4 +507,6 @@ __all__ = [
     "StatusSink",
     "SyncCallable",
     "SyncOutcome",
+    "SyncPreparation",
+    "SyncRollback",
 ]

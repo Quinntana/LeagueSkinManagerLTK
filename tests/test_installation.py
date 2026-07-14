@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,8 +14,11 @@ from league_skin_manager.installation import (
     InstallationError,
     InstallLayout,
     apps_entry_values,
+    create_start_menu_shortcut,
     installed_size_kib,
     quote_command,
+    remove_start_menu_shortcut,
+    start_menu_shortcut_path,
 )
 
 
@@ -43,8 +47,8 @@ def test_apps_entry_has_professional_per_user_values(tmp_path: Path) -> None:
         install_date=date(2026, 7, 13),
     )
 
-    assert values["DisplayName"] == ("League Skin Manager VN", "str")
-    assert values["DisplayVersion"] == ("0.2.0", "str")
+    assert values["DisplayName"] == ("League Skin Manager LTK", "str")
+    assert values["DisplayVersion"] == ("0.1.0", "str")
     assert values["Publisher"] == ("Quinntana", "str")
     assert values["InstallLocation"] == (str(layout.install_dir), "str")
     assert values["UninstallString"] == (f'"{layout.uninstaller.resolve()}"', "str")
@@ -139,7 +143,7 @@ def test_registration_writes_and_removes_only_hkcu(tmp_path: Path) -> None:
 
     registration.register(layout, estimated_size_kib=20)
     assert registry.created == [(registry.HKEY_CURRENT_USER, UNINSTALL_REGISTRY_KEY, 0, 3)]
-    assert registry.values["DisplayName"] == (registry.REG_SZ, "League Skin Manager VN")
+    assert registry.values["DisplayName"] == (registry.REG_SZ, "League Skin Manager LTK")
     assert registry.values["EstimatedSize"] == (registry.REG_DWORD, 20)
 
     assert registration.unregister()
@@ -194,3 +198,37 @@ def test_installed_size_rounds_up_and_rejects_missing_payload(tmp_path: Path) ->
     assert installed_size_kib((first, second)) == 2
     with pytest.raises(InstallationError, match="measure"):
         installed_size_kib((tmp_path / "missing.exe",))
+
+
+def test_start_menu_shortcut_is_exact_and_removable(monkeypatch: Any, tmp_path: Path) -> None:
+    layout = InstallLayout.discover(tmp_path / "LocalAppData")
+    layout.install_dir.mkdir(parents=True)
+    layout.executable.write_bytes(b"app")
+    layout.uninstaller.write_bytes(b"uninstall")
+    appdata = tmp_path / "Roaming"
+    system_root = tmp_path / "Windows"
+    powershell = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    powershell.parent.mkdir(parents=True)
+    powershell.write_bytes(b"powershell")
+    monkeypatch.setenv("SYSTEMROOT", str(system_root))
+    calls: list[dict[str, object]] = []
+
+    def create_fixture(_command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs)
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        Path(str(environment["LSMLTK_SHORTCUT_PATH"])).write_bytes(b"shell-link")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    shortcut = create_start_menu_shortcut(
+        layout,
+        appdata=appdata,
+        runner=create_fixture,
+    )
+
+    assert shortcut == start_menu_shortcut_path(appdata)
+    environment = calls[0]["env"]
+    assert isinstance(environment, dict)
+    assert environment["LSMLTK_SHORTCUT_TARGET"] == str(layout.executable.resolve())
+    assert remove_start_menu_shortcut(appdata) is True
+    assert remove_start_menu_shortcut(appdata) is False

@@ -1,147 +1,109 @@
-"""High-level manager update and skin synchronization workflow."""
+"""Background reconciliation workflow for the local LTK mod library."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from threading import Event
-from typing import Protocol
+from threading import Event, Lock
+from typing import Any
 
 from .controller import AppState, SyncOutcome
-from .manager_update import ManagerUpdateStatus, UntrustedReleaseError
-from .skin_source import SkinManifest, SkinSourceError
-from .sync_service import SkinSource, SyncMutationBlocked, SyncProgress, SyncResult
+from .ltk_engine import LTKInstallation
+from .mod_library import ImportResult, LocalModLibrary
+
+ProviderLookup = Callable[[], LTKInstallation | None]
+EngineHealthCheck = Callable[[], Mapping[str, Any]]
 
 
-class ManifestSource(SkinSource, Protocol):
-    def fetch_manifest(self) -> SkinManifest: ...
+class LibraryWorkflow:
+    """Serialize import requests through the controller's existing worker boundary."""
 
-
-class SyncService(Protocol):
-    def sync(
-        self,
-        source: SkinSource,
-        manifest: SkinManifest,
-        *,
-        cancel_event: Event | None = None,
-        progress: object | None = None,
-    ) -> SyncResult: ...
-
-
-class ManagerUpdateService(Protocol):
-    def update(self, cancel_event: Event) -> ManagerUpdateStatus: ...
-
-
-class SynchronizationWorkflow:
     def __init__(
         self,
         *,
-        source: ManifestSource,
-        sync_service: SyncService,
-        manager_updater: ManagerUpdateService,
-        manager_executable: Path,
-        installed_dir: Path,
+        library: LocalModLibrary,
+        provider_lookup: ProviderLookup,
+        engine_health: EngineHealthCheck | None,
         logger: logging.Logger,
-        manager_is_running: Callable[[], bool] | None = None,
     ) -> None:
-        self.source = source
-        self.sync_service = sync_service
-        self.manager_updater = manager_updater
-        self.manager_executable = manager_executable
-        self.installed_dir = installed_dir
+        self.library = library
+        self.provider_lookup = provider_lookup
+        self.engine_health = engine_health
         self.logger = logger
-        self.manager_is_running = manager_is_running or (lambda: False)
+        self._pending_lock = Lock()
+        self._pending_import: tuple[Path, ...] = ()
+
+    @property
+    def import_pending(self) -> bool:
+        with self._pending_lock:
+            return bool(self._pending_import)
+
+    def queue_import(self, paths: Iterable[Path]) -> bool:
+        values = tuple(Path(path) for path in paths)
+        if not values:
+            return False
+        with self._pending_lock:
+            if self._pending_import:
+                return False
+            self._pending_import = values
+        return True
+
+    def cancel_pending_import(self) -> None:
+        with self._pending_lock:
+            self._pending_import = ()
 
     def __call__(self, cancel_event: Event) -> SyncOutcome:
-        if self._manager_is_running():
-            return SyncOutcome(
-                AppState.OFFLINE_READY,
-                "Sync paused - close CSLOL Manager and try again",
-            )
-        manager_status: ManagerUpdateStatus | None = None
-        manager_error: Exception | None = None
-        try:
-            manager_status = self.manager_updater.update(cancel_event)
-        except Exception as exc:
-            manager_error = exc
-            self.logger.exception("CSLOL Manager update check failed; retaining current install")
-
         if cancel_event.is_set():
-            return SyncOutcome(AppState.OFFLINE_READY, "Stopping sync")
+            return SyncOutcome(AppState.OFFLINE_READY, "Stopping library refresh")
+        with self._pending_lock:
+            pending = self._pending_import
+            self._pending_import = ()
 
-        if self._manager_is_running():
-            return SyncOutcome(
-                AppState.OFFLINE_READY,
-                "Sync paused - close CSLOL Manager and try again",
-            )
+        imported: ImportResult | None = None
+        if pending:
+            imported = self.library.import_packages(pending, cancelled=cancel_event.is_set)
+        if cancel_event.is_set():
+            return SyncOutcome(AppState.OFFLINE_READY, "Stopping library refresh")
+        records = self.library.refresh()
 
+        provider = self._provider()
+        engine_ready = self._engine_ready()
+        detail = f"Ready - {len(records):,} local mod{'s' if len(records) != 1 else ''}"
+        if imported is not None:
+            detail += f"; imported {len(imported.imported)}"
+            if imported.duplicate_count:
+                detail += f", skipped {imported.duplicate_count} duplicate"
+        if not engine_ready:
+            detail += "; build ltk-engine for .modpkg and overlays"
+        if provider is None:
+            detail += "; install official LTK Manager to run mods"
+        elif not provider.injection_provider_available:
+            detail += "; installed LTK release has no new patcher provider"
+
+        state = (
+            AppState.READY
+            if engine_ready and provider is not None and provider.injection_provider_available
+            else AppState.OFFLINE_READY
+        )
+        return SyncOutcome(state, detail)
+
+    def _provider(self) -> LTKInstallation | None:
         try:
-            manifest = self.source.fetch_manifest()
-            if self._manager_is_running():
-                return SyncOutcome(
-                    AppState.OFFLINE_READY,
-                    "Sync paused - close CSLOL Manager and try again",
-                )
-            result = self.sync_service.sync(
-                self.source,
-                manifest,
-                cancel_event=cancel_event,
-                progress=self._progress,
-            )
-        except SyncMutationBlocked as exc:
-            self.logger.info("Skin sync deferred because manager state is unsafe: %s", exc)
-            return SyncOutcome(
-                AppState.OFFLINE_READY,
-                "Sync paused - close CSLOL Manager and try again",
-            )
-        except SkinSourceError as exc:
-            if self._has_usable_install():
-                self.logger.warning("Skin source unavailable; using installed cache: %s", exc)
-                return SyncOutcome(
-                    AppState.OFFLINE_READY,
-                    "Offline - using installed skins",
-                )
-            raise
-
-        patch = result.patch or "unknown patch"
-        detail = f"Ready - {result.installed} skins ({patch})"
-        if manager_error is not None:
-            if not self.manager_executable.is_file():
-                return SyncOutcome(
-                    AppState.OFFLINE_READY,
-                    f"Skins ready ({patch}); install CSLOL Manager manually - see log",
-                )
-            if isinstance(manager_error, UntrustedReleaseError):
-                detail += "; manager update requires a newer app build"
-            else:
-                detail += "; manager update unavailable"
-        elif manager_status is ManagerUpdateStatus.DEFERRED_RUNNING:
-            detail += "; manager update deferred"
-        return SyncOutcome(AppState.READY, detail)
-
-    def _manager_is_running(self) -> bool:
-        try:
-            return self.manager_is_running()
+            return self.provider_lookup()
         except Exception:
-            self.logger.exception("Could not verify whether CSLOL Manager is running; pausing sync")
-            return True
+            self.logger.exception("LTK Manager discovery failed")
+            return None
 
-    def _has_usable_install(self) -> bool:
-        if not self.manager_executable.is_file() or not self.installed_dir.is_dir():
+    def _engine_ready(self) -> bool:
+        if self.engine_health is None:
             return False
         try:
-            return any(self.installed_dir.iterdir())
-        except OSError:
+            result = self.engine_health()
+        except Exception:
+            self.logger.exception("LTK engine health check failed")
             return False
+        return bool(result)
 
-    def _progress(self, value: object) -> None:
-        if not isinstance(value, SyncProgress):
-            return
-        if value.phase in {"preparing", "committing", "complete"}:
-            self.logger.info(
-                "Skin sync %s (%s/%s)",
-                value.phase,
-                value.completed,
-                value.total,
-            )
+
+__all__ = ["EngineHealthCheck", "LibraryWorkflow", "ProviderLookup"]

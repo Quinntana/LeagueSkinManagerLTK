@@ -19,6 +19,7 @@ from league_skin_manager.windows_integration import (
     SingleInstanceMutex,
     StartupRegistration,
     open_path,
+    reveal_path,
 )
 
 
@@ -178,6 +179,28 @@ def test_open_path_uses_windows_shell(monkeypatch: Any, tmp_path: Path) -> None:
     assert opened == [str(tmp_path.resolve())]
 
 
+def test_reveal_file_selects_it_in_explorer_without_executing(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    selected = tmp_path / "mod.fantome"
+    selected.write_bytes(b"mod")
+    system_root = tmp_path / "Windows"
+    explorer = system_root / "explorer.exe"
+    system_root.mkdir()
+    explorer.write_bytes(b"explorer")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+    monkeypatch.setattr("league_skin_manager.windows_integration.os.name", "nt")
+    monkeypatch.setenv("SYSTEMROOT", str(system_root))
+    monkeypatch.setattr(
+        "league_skin_manager.windows_integration.subprocess.Popen",
+        lambda args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    reveal_path(selected)
+
+    assert calls == [([str(explorer), "/select,", str(selected.resolve())], {"close_fds": True})]
+
+
 class Process:
     def __init__(self, name: str | None = None, error: Exception | None = None) -> None:
         self.info = {"name": name}
@@ -187,9 +210,9 @@ class Process:
 def test_process_running_lookup_is_case_insensitive(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         "league_skin_manager.windows_integration.psutil.process_iter",
-        lambda _fields: [Process(None), Process("CSLOL-MANAGER.EXE")],
+        lambda _fields: [Process(None), Process("LTK-MANAGER.EXE")],
     )
-    assert ProcessLauncher.is_running("cslol-manager.exe")
+    assert ProcessLauncher.is_running("ltk-manager.exe")
     assert not ProcessLauncher.is_running("different.exe")
 
 
@@ -216,8 +239,8 @@ def test_running_under_matches_exact_owned_process_paths(monkeypatch: Any, tmp_p
         def __init__(self, executable: Path | None) -> None:
             self.info = {"exe": str(executable) if executable is not None else None}
 
-    manager_dir = tmp_path / "manager"
-    owned = manager_dir / "tools" / "mod-tools.exe"
+    manager_dir = tmp_path / "LTK Manager"
+    owned = manager_dir / "resources" / "ltk_patcher_host.exe"
     unrelated = tmp_path / "elsewhere" / "mod-tools.exe"
     monkeypatch.setattr(
         "league_skin_manager.windows_integration.psutil.process_iter",
@@ -238,7 +261,7 @@ def test_running_under_blocks_known_owned_names_when_executable_is_inaccessible(
 
     processes = [
         Process("unrelated.exe", None),
-        Process("MOD-TOOLS.EXE", None),
+        Process("LTK_PATCHER_HOST.EXE", None),
     ]
     monkeypatch.setattr(
         "league_skin_manager.windows_integration.psutil.process_iter",

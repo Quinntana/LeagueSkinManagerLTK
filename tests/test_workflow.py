@@ -1,160 +1,141 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from pathlib import Path
 from threading import Event
-
-import pytest
+from typing import cast
 
 from league_skin_manager.controller import AppState
-from league_skin_manager.manager_update import ManagerUpdateStatus, UntrustedReleaseError
-from league_skin_manager.skin_source import ManifestFetchError, SkinManifest
-from league_skin_manager.sync_service import SyncResult
-from league_skin_manager.workflow import SynchronizationWorkflow
+from league_skin_manager.ltk_engine import LTKInstallation
+from league_skin_manager.mod_library import ImportResult, LocalModLibrary, ModRecord
+from league_skin_manager.workflow import LibraryWorkflow
 
 
-class Source:
-    def __init__(self, manifest: SkinManifest | Exception) -> None:
-        self.manifest = manifest
-
-    def fetch_manifest(self) -> SkinManifest:
-        if isinstance(self.manifest, Exception):
-            raise self.manifest
-        return self.manifest
-
-    def download(self, *_args: object, **_kwargs: object) -> Path:
-        raise AssertionError("not used")
-
-
-class Syncer:
-    def __init__(self, result: SyncResult) -> None:
-        self.result = result
-        self.calls = 0
-
-    def sync(self, *_args: object, **_kwargs: object) -> SyncResult:
-        self.calls += 1
-        return self.result
+def mod() -> ModRecord:
+    digest = "a" * 64
+    return ModRecord(
+        id=digest,
+        name="Original Ahri Remix",
+        author="Creator",
+        version="1",
+        format="fantome",
+        champions=("Ahri",),
+        tags=(),
+        file_name=f"{digest}.fantome",
+        size=12,
+        content_sha256=digest,
+    )
 
 
-class Updater:
-    def __init__(self, result: ManagerUpdateStatus | Exception) -> None:
-        self.result = result
-        self.calls = 0
+class FakeLibrary:
+    def __init__(self) -> None:
+        self.imported: list[tuple[Path, ...]] = []
+        self.refreshes = 0
 
-    def update(self, _cancel: Event) -> ManagerUpdateStatus:
-        self.calls += 1
-        if isinstance(self.result, Exception):
-            raise self.result
-        return self.result
+    def import_packages(
+        self, paths: tuple[Path, ...], *, cancelled: object | None = None
+    ) -> ImportResult:
+        del cancelled
+        self.imported.append(paths)
+        return ImportResult((mod(),), 1)
+
+    def refresh(self) -> tuple[ModRecord, ...]:
+        self.refreshes += 1
+        return (mod(),)
+
+
+def provider(tmp_path: Path, *, patcher: bool = True) -> LTKInstallation:
+    root = tmp_path / "LTK Manager"
+    return LTKInstallation(
+        root=root,
+        manager_executable=root / "ltk-manager.exe",
+        version="1.12.0",
+        host_executable=root / "ltk_patcher_host.exe" if patcher else None,
+        hook_dll=root / "ltk_patcher_dll.dll" if patcher else None,
+    )
 
 
 def workflow(
-    tmp_path: Path,
-    source: Source,
-    syncer: Syncer,
-    updater: Updater,
-    manager_is_running: Callable[[], bool] | None = None,
-) -> SynchronizationWorkflow:
-    return SynchronizationWorkflow(
-        source=source,  # type: ignore[arg-type]
-        sync_service=syncer,  # type: ignore[arg-type]
-        manager_updater=updater,
-        manager_executable=tmp_path / "manager" / "cslol-manager.exe",
-        installed_dir=tmp_path / "manager" / "installed",
-        logger=logging.getLogger("test"),
-        manager_is_running=manager_is_running,
+    library: FakeLibrary,
+    *,
+    provider_value: LTKInstallation | None,
+    engine: bool,
+) -> LibraryWorkflow:
+    return LibraryWorkflow(
+        library=cast(LocalModLibrary, library),
+        provider_lookup=lambda: provider_value,
+        engine_health=(lambda: {"name": "ltk-engine"}) if engine else None,
+        logger=logging.getLogger("test.workflow"),
     )
 
 
-def test_success_reports_patch_and_deferred_manager_update(tmp_path: Path) -> None:
-    manifest = SkinManifest("a" * 40, "16.13.1", ())
-    syncer = Syncer(SyncResult("a" * 40, "16.13.1", 1920, 20, 1900, 0))
-    value = workflow(
-        tmp_path,
-        Source(manifest),
-        syncer,
-        Updater(ManagerUpdateStatus.DEFERRED_RUNNING),
-    )(Event())
-    assert value.state is AppState.READY
-    assert value.detail == "Ready - 1920 skins (16.13.1); manager update deferred"
-    assert syncer.calls == 1
+def test_refresh_reports_full_ready_state(tmp_path: Path) -> None:
+    library = FakeLibrary()
+    action = workflow(library, provider_value=provider(tmp_path), engine=True)
+
+    outcome = action(Event())
+
+    assert outcome.state is AppState.READY
+    assert outcome.detail == "Ready - 1 local mod"
+    assert library.refreshes == 1
 
 
-def test_offline_source_uses_existing_manager_and_mods(tmp_path: Path) -> None:
-    manager = tmp_path / "manager"
-    installed = manager / "installed" / "custom-mod"
-    installed.mkdir(parents=True)
-    (manager / "cslol-manager.exe").write_bytes(b"manager")
-    value = workflow(
-        tmp_path,
-        Source(ManifestFetchError("offline")),
-        Syncer(SyncResult("", None, 0, 0, 0, 0)),
-        Updater(OSError("offline")),
-    )(Event())
-    assert value.state is AppState.OFFLINE_READY
-    assert value.detail == "Offline - using installed skins"
+def test_import_queue_is_single_slot_and_reports_duplicates(tmp_path: Path) -> None:
+    library = FakeLibrary()
+    action = workflow(library, provider_value=provider(tmp_path), engine=True)
+    paths = (tmp_path / "one.fantome",)
+
+    assert action.queue_import(paths) is True
+    assert action.import_pending is True
+    assert action.queue_import((tmp_path / "two.fantome",)) is False
+    outcome = action(Event())
+
+    assert library.imported == [paths]
+    assert action.import_pending is False
+    assert outcome.detail == "Ready - 1 local mod; imported 1, skipped 1 duplicate"
 
 
-def test_first_run_offline_remains_an_error(tmp_path: Path) -> None:
-    operation = workflow(
-        tmp_path,
-        Source(ManifestFetchError("offline")),
-        Syncer(SyncResult("", None, 0, 0, 0, 0)),
-        Updater(OSError("offline")),
+def test_cancel_and_empty_queue_are_safe(tmp_path: Path) -> None:
+    action = workflow(FakeLibrary(), provider_value=None, engine=False)
+
+    assert action.queue_import(()) is False
+    assert action.queue_import((tmp_path / "one.fantome",)) is True
+    action.cancel_pending_import()
+
+    assert action.import_pending is False
+
+
+def test_missing_components_are_explicit_offline_status(tmp_path: Path) -> None:
+    action = workflow(FakeLibrary(), provider_value=None, engine=False)
+
+    outcome = action(Event())
+
+    assert outcome.state is AppState.OFFLINE_READY
+    assert "build ltk-engine" in outcome.detail
+    assert "install official LTK Manager" in outcome.detail
+
+
+def test_stable_provider_is_not_mislabeled_as_new_patcher(tmp_path: Path) -> None:
+    action = workflow(FakeLibrary(), provider_value=provider(tmp_path, patcher=False), engine=True)
+
+    outcome = action(Event())
+
+    assert outcome.state is AppState.OFFLINE_READY
+    assert "installed LTK release has no new patcher provider" in outcome.detail
+
+
+def test_cancelled_and_failed_health_checks_fail_safe(tmp_path: Path) -> None:
+    library = FakeLibrary()
+    action = LibraryWorkflow(
+        library=cast(LocalModLibrary, library),
+        provider_lookup=lambda: (_ for _ in ()).throw(OSError("registry")),
+        engine_health=lambda: (_ for _ in ()).throw(RuntimeError("engine")),
+        logger=logging.getLogger("test.workflow.failure"),
     )
-    with pytest.raises(ManifestFetchError, match="offline"):
-        operation(Event())
+    cancelled = Event()
+    cancelled.set()
 
-
-def test_untrusted_manager_release_is_actionable_without_discarding_skin_sync(
-    tmp_path: Path,
-) -> None:
-    manifest = SkinManifest("a" * 40, "16.13.1", ())
-    syncer = Syncer(SyncResult("a" * 40, "16.13.1", 1920, 20, 1900, 0))
-    value = workflow(
-        tmp_path,
-        Source(manifest),
-        syncer,
-        Updater(UntrustedReleaseError("future release is not reviewed")),
-    )(Event())
-
-    assert value.state is AppState.OFFLINE_READY
-    assert value.detail == ("Skins ready (16.13.1); install CSLOL Manager manually - see log")
-    assert syncer.calls == 1
-
-
-def test_running_manager_pauses_before_update_or_skin_mutation(tmp_path: Path) -> None:
-    manifest = SkinManifest("a" * 40, "16.13.1", ())
-    syncer = Syncer(SyncResult("a" * 40, "16.13.1", 1920, 0, 1920, 0))
-    updater = Updater(ManagerUpdateStatus.CURRENT)
-
-    value = workflow(
-        tmp_path,
-        Source(manifest),
-        syncer,
-        updater,
-        manager_is_running=lambda: True,
-    )(Event())
-
-    assert value.state is AppState.OFFLINE_READY
-    assert value.detail == "Sync paused - close CSLOL Manager and try again"
-    assert updater.calls == 0
-    assert syncer.calls == 0
-
-
-def test_manager_starting_during_manifest_fetch_prevents_sync(tmp_path: Path) -> None:
-    manifest = SkinManifest("a" * 40, "16.13.1", ())
-    syncer = Syncer(SyncResult("a" * 40, "16.13.1", 1920, 0, 1920, 0))
-    states = iter((False, False, True))
-
-    value = workflow(
-        tmp_path,
-        Source(manifest),
-        syncer,
-        Updater(ManagerUpdateStatus.CURRENT),
-        manager_is_running=lambda: next(states),
-    )(Event())
-
-    assert value.state is AppState.OFFLINE_READY
-    assert syncer.calls == 0
+    assert action(cancelled).detail == "Stopping library refresh"
+    outcome = action(Event())
+    assert outcome.state is AppState.OFFLINE_READY
+    assert "install official LTK Manager" in outcome.detail

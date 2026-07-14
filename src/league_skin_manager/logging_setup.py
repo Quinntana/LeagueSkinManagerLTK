@@ -6,6 +6,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from .config import APP_NAME
+
 LOGGER_NAME = "league_skin_manager"
 
 
@@ -19,7 +21,7 @@ def configure_logging(log_dir: Path) -> logging.Logger:
 
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     file_handler = RotatingFileHandler(
-        log_dir / "LeagueSkinManagerVN.log",
+        log_dir / f"{APP_NAME}.log",
         maxBytes=2_000_000,
         backupCount=3,
         encoding="utf-8",

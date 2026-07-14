@@ -84,6 +84,8 @@ class TrayApplication:
         on_start: Action,
         on_show: Action,
         on_sync: Action,
+        on_start_patcher: Action,
+        on_stop_patcher: Action,
         on_start_manager: Action,
         startup_enabled: StartupGetter,
         set_startup_enabled: StartupSetter,
@@ -96,6 +98,8 @@ class TrayApplication:
         self._on_start = on_start
         self._on_show = on_show
         self._on_sync = on_sync
+        self._on_start_patcher = on_start_patcher
+        self._on_stop_patcher = on_stop_patcher
         self._on_start_manager = on_start_manager
         self._startup_enabled = startup_enabled
         self._set_startup_enabled = set_startup_enabled
@@ -108,6 +112,8 @@ class TrayApplication:
         self._lock = RLock()
         self._state = AppState.STARTING
         self._detail = "Starting"
+        self._runtime_detail = "Stopped"
+        self._runtime_running = False
         self._exit_requested = False
         self._stopped = False
         self._icon = self._backend.Icon(
@@ -159,14 +165,24 @@ class TrayApplication:
         with self._lock:
             self._state = state
             self._detail = detail
-            title = self._title()
-            image = self._image_factory(state)
-        try:
-            self._icon.title = title
-            self._icon.icon = image
-            self._refresh_menu()
-        except Exception:
-            self._logger.exception("Unable to refresh tray status")
+            try:
+                self._icon.title = self._title()
+                self._icon.icon = self._image_factory(state)
+                self._refresh_menu()
+            except Exception:
+                self._logger.exception("Unable to refresh tray status")
+
+    def update_runtime_status(self, detail: str, running: bool) -> None:
+        """Update the patcher status without replacing the library status."""
+
+        with self._lock:
+            self._runtime_detail = detail
+            self._runtime_running = running
+            try:
+                self._icon.title = self._title()
+                self._refresh_menu()
+            except Exception:
+                self._logger.exception("Unable to refresh tray runtime status")
 
     def notify(self, title: str, message: str) -> None:
         """Notification sink suitable for :class:`AppController`."""
@@ -183,20 +199,36 @@ class TrayApplication:
     def _build_menu(self) -> object:
         with self._lock:
             detail = self._detail
+            runtime_detail = self._runtime_detail
         return self._backend.Menu(
             self._backend.MenuItem(
-                "Open LeagueSkinManagerVN",
+                "Open League Skin Manager LTK",
                 self._show_clicked,
                 default=True,
             ),
             self._backend.MenuItem(
-                f"Status: {detail}",
+                f"Library: {detail}",
                 None,
                 enabled=False,
             ),
-            self._backend.MenuItem("Sync now", self._sync_clicked),
             self._backend.MenuItem(
-                "Start manager",
+                f"Runtime: {runtime_detail}",
+                None,
+                enabled=False,
+            ),
+            self._backend.MenuItem("Refresh library", self._sync_clicked),
+            self._backend.MenuItem(
+                "Start enabled mods",
+                self._start_patcher_clicked,
+                enabled=self._start_patcher_enabled,
+            ),
+            self._backend.MenuItem(
+                "Stop mods",
+                self._stop_patcher_clicked,
+                enabled=self._stop_patcher_enabled,
+            ),
+            self._backend.MenuItem(
+                "Open LTK Manager",
                 self._start_manager_clicked,
             ),
             self._backend.MenuItem(
@@ -216,10 +248,25 @@ class TrayApplication:
             return
 
     def _title(self) -> str:
-        return f"{self._app_name} - {self._detail}"
+        with self._lock:
+            return f"{self._app_name} - Library: {self._detail} | Runtime: {self._runtime_detail}"
 
     def _sync_clicked(self, _icon: TrayIcon, _item: object) -> None:
-        self._invoke("skin sync", self._on_sync)
+        self._invoke("library refresh", self._on_sync)
+
+    def _start_patcher_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("starting enabled mods", self._on_start_patcher)
+
+    def _stop_patcher_clicked(self, _icon: TrayIcon, _item: object) -> None:
+        self._invoke("stopping mods", self._on_stop_patcher)
+
+    def _start_patcher_enabled(self, _item: object) -> bool:
+        with self._lock:
+            return not self._runtime_running
+
+    def _stop_patcher_enabled(self, _item: object) -> bool:
+        with self._lock:
+            return self._runtime_running
 
     def _show_clicked(self, _icon: TrayIcon, _item: object) -> None:
         self._invoke("opening the desktop window", self._on_show)
@@ -260,7 +307,7 @@ class TrayApplication:
             except Exception as exc:
                 self._logger.exception("Tray callback failed during application shutdown")
                 self.notify(
-                    "LeagueSkinManagerVN",
+                    "League Skin Manager LTK",
                     f"Could not complete application shutdown: {exc}",
                 )
                 return
@@ -282,7 +329,7 @@ class TrayApplication:
         except Exception as exc:
             self._logger.exception("Tray callback failed during %s", description)
             self.notify(
-                "LeagueSkinManagerVN",
+                "League Skin Manager LTK",
                 f"Could not complete {description}: {exc}",
             )
             return None

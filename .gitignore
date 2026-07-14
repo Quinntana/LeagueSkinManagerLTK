@@ -12,9 +12,6 @@ venv/
 env/
 ENV/
 
-# Poetry lock (optional to ignore)
-poetry.lock
-
 # PyInstaller build/dist
 build/
 build_uninstall/
@@ -27,6 +24,9 @@ dist/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
+
+# Rust engine build output
+engine/target/
 
 # Logs and data
 data/

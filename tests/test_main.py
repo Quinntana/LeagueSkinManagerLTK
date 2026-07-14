@@ -52,7 +52,7 @@ def test_second_instance_signals_existing_desktop_without_launching_manager(
 ) -> None:
     class Paths:
         log_dir = tmp_path / "logs"
-        manager_dir = tmp_path / "manager"
+        provider_dir = tmp_path / "LTK Manager"
 
         @staticmethod
         def ensure() -> None:
@@ -160,18 +160,18 @@ def test_composition_failure_closes_created_resources_and_releases_mutex(
     tmp_path: Path,
 ) -> None:
     class Paths:
+        project_root = tmp_path
+        data_dir = tmp_path / "data"
         log_dir = tmp_path / "logs"
-        manager_dir = tmp_path / "manager"
-        installed_dir = manager_dir / "installed"
-        managed_manifest_file = tmp_path / "managed.json"
-        package_cache_dir = tmp_path / "cache"
-        manager_version_file = manager_dir / "version.txt"
+        package_dir = tmp_path / "library" / "packages"
+        library_manifest_file = tmp_path / "library" / "library.json"
 
         @staticmethod
         def ensure() -> None:
             return None
 
     released: list[bool] = []
+    visible_errors: list[tuple[str, Path | None]] = []
 
     class Mutex:
         def acquire(self) -> bool:
@@ -179,15 +179,6 @@ def test_composition_failure_closes_created_resources_and_releases_mutex(
 
         def release(self) -> None:
             released.append(True)
-
-    closed: list[bool] = []
-
-    class Source:
-        def __init__(self, **_kwargs: object) -> None:
-            return None
-
-        def close(self) -> None:
-            closed.append(True)
 
     class Launcher:
         def __init__(self, _logger: logging.Logger) -> None:
@@ -198,14 +189,20 @@ def test_composition_failure_closes_created_resources_and_releases_mutex(
     monkeypatch.setattr(app_main, "SingleInstanceMutex", Mutex)
     monkeypatch.setattr(app_main, "InstanceActivationEvent", NoopActivationEvent)
     monkeypatch.setattr(app_main, "ProcessLauncher", Launcher)
-    monkeypatch.setattr(app_main, "GitHubSkinSource", Source)
     monkeypatch.setattr(
         app_main,
-        "SkinSyncService",
+        "_show_startup_error",
+        lambda error, log_file: visible_errors.append((str(error), log_file)),
+    )
+    monkeypatch.setattr(
+        app_main,
+        "LocalModLibrary",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("composition failed")),
     )
     monkeypatch.setattr(sys, "platform", "win32")
 
     assert app_main.run() == 1
-    assert closed == [True]
     assert released == [True]
+    assert visible_errors == [
+        ("composition failed", tmp_path / "logs" / "LeagueSkinManagerLTK.log")
+    ]

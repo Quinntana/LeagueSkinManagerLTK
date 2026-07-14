@@ -11,27 +11,32 @@ from league_skin_manager.logging_setup import configure_logging
 
 
 def test_paths_are_side_effect_free_until_ensured(tmp_path: Path) -> None:
-    appdata = tmp_path / "roaming"
+    local_appdata = tmp_path / "local"
     project = tmp_path / "project"
-    paths = AppPaths.discover(appdata=appdata, project_root=project)
+    paths = AppPaths.discover(local_appdata=local_appdata, project_root=project)
 
-    assert paths.data_dir == appdata.resolve() / APP_NAME
-    assert paths.installed_dir == paths.manager_dir / "installed"
+    assert paths.data_dir == local_appdata.resolve() / APP_NAME
+    assert paths.package_dir == paths.library_dir / "packages"
+    assert paths.default_profile_file == paths.profile_dir / "default.json"
+    assert paths.library_manifest_file == paths.library_dir / "library.json"
     assert not paths.data_dir.exists()
 
     paths.ensure()
-    assert paths.installed_dir.is_dir()
-    assert paths.package_cache_dir.is_dir()
+    assert paths.package_dir.is_dir()
+    assert paths.profile_dir.is_dir()
+    assert paths.engine_state_dir.is_dir()
+    assert paths.overlay_dir.is_dir()
+    assert paths.cache_dir.is_dir()
     assert paths.log_dir.is_dir()
 
 
 def test_runtime_config_rejects_unsafe_values() -> None:
     with pytest.raises(ValueError, match="positive"):
         RuntimeConfig(process_poll_seconds=0)
-    with pytest.raises(ValueError, match="between"):
-        RuntimeConfig(download_workers=17)
     with pytest.raises(ValueError, match="positive"):
-        RuntimeConfig(download_attempts=0)
+        RuntimeConfig(engine_timeout_seconds=0)
+    with pytest.raises(ValueError, match="positive"):
+        RuntimeConfig(overlay_timeout_seconds=0)
 
 
 def test_read_json_uses_fallback_for_malformed_content(tmp_path: Path) -> None:

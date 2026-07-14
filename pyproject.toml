@@ -1,23 +1,28 @@
-[tool.poetry]
-name = "LeagueSkinManagerVN"
-version = "0.2.0"
-description = "A tool for managing League of Legends custom skins"
-authors = ["Quinntana <archimedesstar@gmail.com>"]
-license = "GPL-3.0"
+[project]
+name = "LeagueSkinManagerLTK"
+version = "0.1.0"
+description = "A searchable custom-mod library with an isolated LeagueToolkit engine"
+authors = [{ name = "Quinntana", email = "archimedesstar@gmail.com" }]
+license = "GPL-3.0-only"
 readme = "README.md"
-packages = [{ include = "league_skin_manager", from = "src" }]
+requires-python = ">=3.10,<3.15"
+dependencies = [
+    "pystray>=0.19.5,<0.20.0",
+    "psutil>=7.2.2,<8.0.0",
+    "Pillow>=12.3.0,<13.0.0",
+]
 
-[tool.poetry.scripts]
+[project.scripts]
 league-skin-manager = "league_skin_manager.__main__:main"
 league-skin-manager-uninstall = "league_skin_manager.uninstall:main"
 league-skin-manager-setup = "league_skin_manager.installer:main"
 
-[tool.poetry.dependencies]
-python = ">=3.10,<3.15"
-requests = "^2.31.0"
-pystray = "^0.19.4"
-psutil = "^5.9.8"
-Pillow = "^10.0.0"
+[project.urls]
+Repository = "https://github.com/Quinntana/LeagueSkinManagerLTK"
+Issues = "https://github.com/Quinntana/LeagueSkinManagerLTK/issues"
+
+[tool.poetry]
+packages = [{ include = "league_skin_manager", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 pyinstaller = "^6.15.0"
@@ -25,7 +30,6 @@ pytest = "^9.0.0"
 pytest-cov = "^7.0.0"
 ruff = "^0.15.0"
 mypy = "^1.20.0"
-types-requests = "^2.32.0"
 
 [build-system]
 requires = ["poetry-core"]

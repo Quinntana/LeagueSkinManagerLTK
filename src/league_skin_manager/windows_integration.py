@@ -18,10 +18,10 @@ import psutil
 from .config import APP_NAME, MANAGER_PROCESS_NAMES
 
 ERROR_ALREADY_EXISTS = 183
-LEGACY_MUTEX_NAME = "LeagueSkinManagerVN_Mutex_v1"
-MUTEX_NAME = "Local\\LeagueSkinManagerVN_Mutex_v2"
+LEGACY_MUTEX_NAME = f"{APP_NAME}_Mutex_v1"
+MUTEX_NAME = f"Local\\{APP_NAME}_Mutex_v2"
 MUTEX_NAMES = (LEGACY_MUTEX_NAME, MUTEX_NAME)
-ACTIVATION_EVENT_NAME = "Local\\LeagueSkinManagerVN_Activate_v1"
+ACTIVATION_EVENT_NAME = f"Local\\{APP_NAME}_Activate_v1"
 WAIT_OBJECT_0 = 0x00000000
 WAIT_TIMEOUT = 0x00000102
 
@@ -70,7 +70,7 @@ class SingleInstanceMutex:
 
     def __enter__(self) -> SingleInstanceMutex:
         if not self.acquire():
-            raise RuntimeError("LeagueSkinManagerVN is already running")
+            raise RuntimeError(f"{APP_NAME} is already running")
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -291,3 +291,24 @@ def open_path(path: Path) -> None:
     if os.name != "nt":
         raise OSError("Opening paths is supported only on Windows")
     os.startfile(str(path.resolve()))
+
+
+def reveal_path(path: Path) -> None:
+    """Open a directory, or select a file in Explorer without executing it."""
+
+    if os.name != "nt":
+        raise OSError("Revealing paths is supported only on Windows")
+    resolved = path.resolve(strict=True)
+    if resolved.is_dir():
+        os.startfile(str(resolved))
+        return
+    system_root = os.environ.get("SYSTEMROOT")
+    if not system_root:
+        raise OSError("SYSTEMROOT is unavailable")
+    explorer = Path(system_root) / "explorer.exe"
+    if not explorer.is_file():
+        raise OSError("Windows Explorer is unavailable")
+    subprocess.Popen(
+        [str(explorer), "/select,", str(resolved)],
+        close_fds=True,
+    )

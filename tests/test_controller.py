@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
-from threading import Event, Lock, current_thread
+from threading import Event, Lock, Thread, current_thread
 
 import pytest
 
@@ -113,8 +113,8 @@ def test_repeated_sync_clicks_never_create_parallel_workers() -> None:
     assert maximum_active == 1
     assert sync_daemon is False
     assert notifications[-1] == (
-        "Sync not started",
-        "A skin sync is already in progress.",
+        "Library operation not started",
+        "A library operation is already in progress.",
     )
 
     release.set()
@@ -124,6 +124,53 @@ def test_repeated_sync_clicks_never_create_parallel_workers() -> None:
         AppState.SYNCING,
         AppState.READY,
     ]
+    assert controller.shutdown() is True
+
+
+def test_prepared_library_operation_is_atomic_against_refresh() -> None:
+    monitor = FakeMonitor()
+    prepare_entered = Event()
+    release_prepare = Event()
+    sync_entered = Event()
+    release_sync = Event()
+    prepared: list[str] = []
+    results: dict[str, bool] = {}
+
+    def prepare_import() -> bool:
+        prepare_entered.set()
+        assert release_prepare.wait(1)
+        prepared.append("import")
+        return True
+
+    def sync(stop_event: Event) -> None:
+        assert prepared == ["import"]
+        sync_entered.set()
+        while not release_sync.is_set() and not stop_event.is_set():
+            stop_event.wait(0.01)
+
+    controller = AppController(
+        sync=sync,
+        launcher=lambda: True,
+        monitor=monitor,
+        sync_on_start=False,
+    )
+    controller.start()
+
+    importer = Thread(
+        target=lambda: results.setdefault("import", controller.request_sync(prepare=prepare_import))
+    )
+    refresh = Thread(target=lambda: results.setdefault("refresh", controller.request_sync()))
+    importer.start()
+    assert prepare_entered.wait(1)
+    refresh.start()
+    release_prepare.set()
+    importer.join(1)
+    refresh.join(1)
+
+    assert results == {"import": True, "refresh": False}
+    assert sync_entered.wait(1)
+    release_sync.set()
+    wait_until(lambda: not controller.sync_in_progress)
     assert controller.shutdown() is True
 
 
@@ -149,7 +196,7 @@ def test_sync_failure_is_retryable_and_reported() -> None:
     wait_until(lambda: controller.state is AppState.ERROR)
 
     assert "network unavailable" in controller.status_detail
-    assert ("Skin sync failed", "network unavailable") in notifications
+    assert ("Library operation failed", "network unavailable") in notifications
     assert controller.request_sync() is True
     wait_until(lambda: controller.state is AppState.READY)
     assert attempts == 2
@@ -199,6 +246,7 @@ def test_process_callback_launches_once_per_pid_and_resets_when_gone() -> None:
         launcher=launcher,
         monitor=monitor,
         sync_on_start=False,
+        auto_launch_on_league=True,
     )
     controller.start()
     assert monitor.started.wait(1)
@@ -235,6 +283,7 @@ def test_launcher_failure_is_contained_and_not_retried_for_same_pid() -> None:
         monitor=monitor,
         notify_sink=lambda title, message: notifications.append((title, message)),
         sync_on_start=False,
+        auto_launch_on_league=True,
     )
     controller.start()
     assert monitor.started.wait(1)
@@ -242,7 +291,7 @@ def test_launcher_failure_is_contained_and_not_retried_for_same_pid() -> None:
     monitor.emit(77)
     monitor.emit(77)
     assert attempts == 1
-    assert notifications == [("CSLOL Manager", "Could not start manager: manager missing")]
+    assert notifications == [("LTK Manager", "Could not start manager: manager missing")]
     assert controller.shutdown() is True
 
 
@@ -267,6 +316,7 @@ def test_league_launch_waits_for_sync_and_keeps_latest_live_pid() -> None:
         launcher=launcher,
         monitor=monitor,
         sync_on_start=True,
+        auto_launch_on_league=True,
     )
     controller.start()
     assert monitor.started.wait(1)
@@ -308,6 +358,7 @@ def test_pending_league_launch_is_discarded_when_client_exits_during_sync() -> N
         launcher=launcher,
         monitor=monitor,
         sync_on_start=True,
+        auto_launch_on_league=True,
     )
     controller.start()
     assert sync_started.wait(1)
@@ -351,8 +402,8 @@ def test_manual_manager_launch_is_queued_until_sync_finishes() -> None:
     assert controller.start_manager() is True
     assert launches == 0
     assert notifications[-1] == (
-        "CSLOL Manager",
-        "Manager launch queued until skin synchronization finishes.",
+        "LTK Manager",
+        "Manager launch queued until the library operation finishes.",
     )
 
     release.set()
@@ -451,7 +502,7 @@ def test_shutdown_has_one_bounded_deadline_for_uncooperative_work() -> None:
     assert controller.shutdown(timeout_seconds=0.03) is False
     elapsed = time.monotonic() - started
     assert elapsed < 0.2
-    assert "skin-sync-worker" in notifications[-1][1]
+    assert "library-worker" in notifications[-1][1]
 
     release.set()
     wait_until(lambda: not controller.sync_in_progress)
