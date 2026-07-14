@@ -2,11 +2,16 @@ name: Windows app
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: windows-app-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   quality-and-package:

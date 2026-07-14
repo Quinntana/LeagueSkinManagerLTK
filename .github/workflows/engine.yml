@@ -2,6 +2,7 @@ name: LTK Engine
 
 on:
   push:
+    branches: [main]
     paths:
       - "engine/**"
       - ".github/workflows/engine.yml"
@@ -13,6 +14,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ltk-engine-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
