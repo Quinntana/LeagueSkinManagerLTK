@@ -53,7 +53,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = [".", "src"]
 addopts = "-q --cov=league_skin_manager --cov-report=term-missing --cov-fail-under=80"
 
 [tool.coverage.run]
